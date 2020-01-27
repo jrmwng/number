@@ -4,11 +4,92 @@
 
 #include <algorithm>
 #include <type_traits>
+#include <tuple>
+#include <array>
 
 namespace jrmwng
 {
 	namespace number
 	{
+#ifdef _M_X64
+		using unsigned_type = unsigned long long;
+#else
+		using unsigned_type = unsigned long;
+#endif
+
+		namespace
+		{
+			class Cnop
+			{
+			public:
+				Cnop(unsigned_type uValue)
+				{
+					// NOP
+				}
+				Cnop & operator = (unsigned_type)
+				{
+					return *this;
+				}
+				Cnop & operator |= (unsigned_type)
+				{
+					return *this;
+				}
+				operator unsigned_type () const
+				{
+					return 0U;
+				}
+			};
+			class Cdebug_break
+			{
+			public:
+				Cdebug_break(unsigned_type uValue)
+				{
+					if (uValue)
+					{
+						__debugbreak();
+					}
+				}
+			};
+			class Cthrow
+			{
+			public:
+				Cthrow(unsigned_type uValue)
+				{
+					if (uValue)
+					{
+						throw uValue;
+					}
+				}
+			};
+			template <typename Taction>
+			class Cunsigned
+			{
+				unsigned_type m_uValue;
+			public:
+				Cunsigned(unsigned_type uValue)
+					: m_uValue(uValue)
+				{
+					Taction const action(uValue);
+				}
+				typename Cunsigned & operator = (unsigned_type uValue)
+				{
+					m_uValue = uValue;
+					Taction const action(uValue);
+					return *this;
+				}
+				typename Cunsigned & operator |= (unsigned_type uValue)
+				{
+					m_uValue |= uValue;
+					Taction const action(uValue);
+					return *this;
+				}
+				operator unsigned_type () const
+				{
+					return m_uValue;
+				}
+			};
+		}
+
 		template <typename Ta, typename Tb>
 		struct numbers_traits
 		{
@@ -18,24 +99,35 @@ namespace jrmwng
 		struct multiplies_tag {};
 		struct dividies_tag {};
 
-		template <size_t uUNSIGNED_BITS>
+		struct integer_traits
+		{
+#ifdef _DEBUG
+			using overflow_type  = Cunsigned<Cdebug_break>;
+			using underflow_type = Cunsigned<Cdebug_break>;
+#else
+			using overflow_type  = Cnop;
+			using underflow_type = Cnop;
+#endif
+		};
+
+		template <size_t uUNSIGNED_BITS, typename Ttraits = integer_traits>
 		class Cinteger
 		{
 			friend class Cinteger;
 		public:
-#ifdef _M_X64
-			using unsigned_type = unsigned long long;
-#else
-			using unsigned_type = unsigned int;
-#endif
 			template <size_t uACCUMULATOR_BITS>
 			using accumulator_type = Cinteger<uUNSIGNED_BITS + uACCUMULATOR_BITS>;
+
 		private:
 			enum Econstant
 			{
-				SIZE = (uUNSIGNED_BITS + (sizeof(unsigned_type) * 8 - 1)) / (sizeof(unsigned_type) * 8)
+				SIZE = (uUNSIGNED_BITS + (sizeof(unsigned_type) * 8U - 1U)) / (sizeof(unsigned_type) * 8U),
+				OVERFLOW_MASK = (uUNSIGNED_BITS < sizeof(unsigned_type) * 8U) ? (~((1U << (uUNSIGNED_BITS % (sizeof(unsigned_type) * 8U))) - 1U)) : 0U,
 			};
+
 			unsigned_type m_auValue[SIZE];
+			typename Ttraits::overflow_type  m_uOverflow = 0;
+			typename Ttraits::underflow_type m_uUnderflow = 0;
 
 #ifdef _M_X64
 			static unsigned char addcarry(unsigned char ubCarry, unsigned long long uLeft, unsigned long long uRight, unsigned long long *puResult)
@@ -72,20 +164,17 @@ namespace jrmwng
 				return _mulx_u32(uLeft, uRight, puHigh);
 			}
 #endif
-			template <size_t... uINDEX>
-			Cinteger(unsigned_type tValue, std::index_sequence<uINDEX...>)
-				: m_auValue{ tValue, (uINDEX, unsigned_type(0))... }
-			{
-				static_assert(sizeof...(uINDEX) + 1 == SIZE, "requirement of this constructor");
-			}
+
 		public:
-			Cinteger(unsigned_type tValue = 0)
-				: Cinteger(tValue, std::make_index_sequence<SIZE - 1>())
+			template <typename... Tunsigned>
+			Cinteger(unsigned_type uValue0, Tunsigned ... uValues)
+				: m_auValue{ uValue0, uValues... }
+				, m_uOverflow(m_auValue[SIZE - 1] & OVERFLOW_MASK)
 			{
 			}
 
-			template <size_t u1, size_t u2>
-			Cinteger(Cinteger<u1> const & left, Cinteger<u2> const & right, add_tag)
+			template <size_t u1, typename T1, size_t u2, typename T2>
+			Cinteger(Cinteger<u1, T1> const & left, Cinteger<u2, T2> const & right, add_tag)
 			{
 				unsigned char ubCarry = 0;
 
@@ -105,9 +194,19 @@ namespace jrmwng
 				{
 					ubCarry = addcarry(ubCarry, 0, 0, &m_auValue[uIndex]);
 				}
+				m_uOverflow = (m_auValue[SIZE - 1] & OVERFLOW_MASK) | ubCarry;
+
+				for (size_t uLeft = std::size(m_auValue), uLeftEnd = std::size(left.m_auValue); uLeft < uLeftEnd; uLeft++)
+				{
+					m_uOverflow |= left.m_auValue[uLeft];
+				}
+				for (size_t uRight = std::size(m_auValue), uRightEnd = std::size(right.m_auValue); uRight < uRightEnd; uRight++)
+				{
+					m_uOverflow |= right.m_auValue[uRight];
+				}
 			}
-			template <size_t uTHAT>
-			typename Cinteger & operator += (Cinteger<uTHAT> const & that)
+			template <size_t uTHAT, typename Tthat_traits>
+			typename Cinteger & operator += (Cinteger<uTHAT, Tthat_traits> const & that)
 			{
 				unsigned char ubCarry = 0;
 
@@ -119,28 +218,17 @@ namespace jrmwng
 				{
 					ubCarry = addcarry(ubCarry, m_auValue[uIndex], 0, &m_auValue[uIndex]);
 				}
-				if (ubCarry)
-				{
-					__debugbreak(); // overflow
-				}
-#ifdef _DEBUG
-				if (m_auValue[SIZE - 1] & ~((1 << (uUNSIGNED_BITS % (sizeof(unsigned_type) * 8))) - 1))
-				{
-					__debugbreak(); // overflow
-				}
-#endif
+				m_uOverflow = (m_auValue[SIZE - 1] & OVERFLOW_MASK) | ubCarry;
+
 				for (size_t uIndex = std::size(m_auValue), uIndexEnd = std::size(that.m_auValue); uIndex < uIndexEnd; uIndex++)
 				{
-					if (that.m_auValue[uIndex])
-					{
-						__debugbreak(); // overflow
-					}
+					m_uOverflow |= that.m_auValue[uIndex];
 				}
 				return *this;
 			}
 
-			template <size_t u1, size_t u2>
-			Cinteger(Cinteger<u1> const & left, Cinteger<u2> const & right, minus_tag)
+			template <size_t u1, typename T1, size_t u2, typename T2>
+			Cinteger(Cinteger<u1, T1> const & left, Cinteger<u2, T2> const & right, minus_tag)
 			{
 				unsigned char ubBorrow = 0;
 
@@ -160,9 +248,35 @@ namespace jrmwng
 				{
 					ubBorrow = subborrow(ubBorrow, 0, 0, &m_auValue[uIndex]);
 				}
+
+				m_uUnderflow = (m_auValue[SIZE - 1] & OVERFLOW_MASK) | ubBorrow;
+
+				for (size_t uIndex = std::size(m_auValue), uIndexEnd = std::min(std::size(left.m_auValue), std::size(right.m_auValue)); uIndex < uIndexEnd; uIndex++)
+				{
+					unsigned_type uTemp;
+					{
+						ubBorrow = subborrow(ubBorrow, left.m_auValue, right.m_auValue, &uTemp);
+					}
+					if (ubBorrow)
+					{
+						m_uUnderflow |= uTemp;
+					}
+					else
+					{
+						m_uOverflow |= uTemp;
+					}
+				}
+				for (size_t uLeft = std::max(std::size(m_auValue), std::size(right.m_auValue)), uLeftEnd = std::size(left.m_auValue); uLeft < uLeftEnd; uLeft++)
+				{
+					m_uOverflow |= left.m_auValue[uLeft];
+				}
+				for (size_t uRight = std::max(std::size(m_auValue), std::size(left.m_auValue)), uRightEnd = std::size(right.m_auValue); uRight < uRightEnd; uRight++)
+				{
+					m_uUnderflow |= right.m_auValue[uRight];
+				}
 			}
-			template <size_t uTHAT>
-			typename Cinteger & operator -= (Cinteger<uTHAT> const & that)
+			template <size_t uTHAT, typename Tthat_traits>
+			typename Cinteger & operator -= (Cinteger<uTHAT, Tthat_traits> const & that)
 			{
 				unsigned char ubBorrow = 0;
 
@@ -174,22 +288,18 @@ namespace jrmwng
 				{
 					ubBorrow = subborrow(ubBorrow, m_auValue[uIndex], 0, &m_auValue[uIndex]);
 				}
-				if (ubBorrow)
-				{
-					__debugbreak(); // underflow
-				}
+
+				m_uUnderflow = (m_auValue[SIZE - 1] & OVERFLOW_MASK) | ubBorrow;
+
 				for (size_t uIndex = std::size(m_auValue), uIndexEnd = std::size(that.m_auValue); uIndex < uIndexEnd; uIndex++)
 				{
-					if (that.m_auValue[uIndex])
-					{
-						__debugbreak(); // underflow
-					}
+					m_uUnderflow |= that.m_auValue[uIndex];
 				}
 				return *this;
 			}
 
-			template <size_t u1, size_t u2>
-			Cinteger(Cinteger<u1> const & left, Cinteger<u2> const & right, multiplies_tag)
+			template <size_t u1, typename T1, size_t u2, typename T2>
+			Cinteger(Cinteger<u1, T1> const & left, Cinteger<u2, T2> const & right, multiplies_tag)
 			{
 				unsigned_type tLo(0);
 				unsigned_type tHi(0);
@@ -210,12 +320,7 @@ namespace jrmwng
 						unsigned char const ubCarry2 = addcarryx(ubCarry1, tHi, tLocalHi, &tHi);
 						unsigned char const ubCarry3 = addcarryx(ubCarry2, tCarry, 0, &tCarry);
 
-#ifdef _DEBUG
-						if (ubCarry3)
-						{
-							__debugbreak();
-						}
-#endif
+						m_uOverflow |= ubCarry3;
 					}
 
 					m_auValue[uIndex] = tLo;
@@ -224,24 +329,21 @@ namespace jrmwng
 					tHi = tCarry;
 				}
 
-#ifdef _DEBUG
-				if (tLo || tHi)
-				{
-					__debugbreak();
-				}
-#endif
+				m_uOverflow |= (m_auValue[SIZE - 1] & OVERFLOW_MASK) | tLo | tHi;
 			}
-			template <size_t uTHAT>
-			typename Cinteger & operator *= (Cinteger<uTHAT> const & that)
+			template <size_t uTHAT, typename Tthat_traits>
+			typename Cinteger & operator *= (Cinteger<uTHAT, Tthat_traits> const & that)
 			{
 				unsigned_type tCarry(0);
 				unsigned_type tHi(0);
+
+				// TODO: check for overflow bits
 
 				for (size_t uIndexR = std::size(m_auValue); 0 < uIndexR; uIndexR--)
 				{
 					unsigned_type tLo(0);
 
-					for (size_t uThat = 0, uThatEnd = std::min(std::size(m_auValue), uIndexR), uThis = uIndexR - 1; uThat < uThatEnd; uThat++, uThis--)
+					for (size_t uThat = 0, uThatEnd = std::min(uIndexR, std::size(that.m_auValue)), uThis = uIndexR - 1; uThat < uThatEnd; uThat++, uThis--)
 					{
 						unsigned_type tLocalHi;
 						unsigned_type tLocalLo = mulx(m_auValue[uThis], that.m_auValue[uThat], &tLocalHi);
@@ -251,24 +353,17 @@ namespace jrmwng
 						unsigned char const ubCarry2 = addcarryx(ubCarry1, tHi, tLocalHi, &tHi);
 						unsigned char const ubCarry3 = addcarryx(ubCarry2, tCarry, 0, &tCarry);
 
-#ifdef _DEBUG
-						if (ubCarry3)
-						{
-							__debugbreak();
-						}
-#endif
+						m_uOverflow |= ubCarry3;
 					}
 
 					if (uIndexR + 1 < std::size(m_auValue))
 					{
 						m_auValue[uIndexR + 1] = tCarry;
 					}
-#ifdef _DEBUG
-					else if (tCarry)
+					else
 					{
-						__debugbreak();
+						m_uOverflow |= tCarry;
 					}
-#endif
 
 					tCarry = tHi;
 					tHi = tLo;
@@ -278,59 +373,155 @@ namespace jrmwng
 				{
 					m_auValue[1] = tCarry;
 				}
-#ifdef _DEBUG
-				else if (tCarry)
+				else
 				{
-					__debugbreak();
+					m_uOverflow |= tCarry;
 				}
-#endif
 
 				if (0 < std::size(m_auValue))
 				{
 					m_auValue[0] = tHi;
 				}
-#ifdef _DEBUG
-				else if (tHi)
+				else
 				{
-					__debugbreak();
+					m_uOverflow |= tHi;
 				}
-#endif
+
+				m_uOverflow |= (m_auValue[SIZE - 1] & OVERFLOW_MASK);
 				return *this;
 			}
 
-			template <size_t u1, size_t u2>
-			Cinteger(Cinteger<u1> const & left, Cinteger<u2> const & right, dividies_tag)
+			template <size_t u1, typename T1, size_t u2, typename T2>
+			Cinteger(Cinteger<u1, T1> const & left, Cinteger<u2, T2> const & right, dividies_tag)
 			{
 				static_assert(false, "This constructor is not implemented");
 			}
+
+			Cinteger(char const *pcText, Cinteger<5U, Ttraits> const uRadix = 10U)
+				: Cinteger(0U)
+			{
+				if (pcText)
+				{
+					for (char const *itDigit = pcText; *itDigit; ++itDigit)
+					{
+						char const cDigit = *itDigit;
+
+						unsigned_type uDigit = 0U;
+						{
+							if ('0' <= cDigit && cDigit <= '9')
+							{
+								uDigit = cDigit - '0';
+							}
+							else if ('a' <= cDigit && cDigit <= 'z')
+							{
+								uDigit = 10U + cDigit - 'a';
+							}
+							else if ('A' <= cDigit && cDigit <= 'Z')
+							{
+								uDigit = 10U + cDigit - 'A';
+							}
+						}
+
+						if (uDigit < uRadix.m_auValue[0])
+						{
+							*this *= uRadix;
+							*this += Cinteger<5, Ttraits>(uDigit);
+						}
+						else
+						{
+							m_uOverflow |= uDigit;
+						}
+					}
+					m_uOverflow |= (m_auValue[SIZE - 1] & OVERFLOW_MASK);
+				}
+			}
+
+			template <size_t uTHAT_BITS, typename Tthat_traits, typename Tpredicate>
+			bool compare(Cinteger<uTHAT_BITS, Tthat_traits> const & that, Tpredicate tPredicate) const
+			{
+				static_assert(std::is_same_v<Tpredicate, std::equal_to<unsigned_type>> == false, "Use 'std::not_equal_to<...>' instead of 'std::equal_to<...>'");
+
+				for (size_t uThis = std::size(that.m_auValue), uThisEnd = std::size(m_auValue); uThis < uThisEnd; uThis++)
+				{
+					if (tPredicate(m_auValue[uThis], 0U))
+					{
+						return true;
+					}
+				}
+				for (size_t uThat = std::size(m_auValue), uThatEnd = std::size(that.m_auValue); uThat < uThatEnd; uThat++)
+				{
+					if (tPredicate(0U, that.m_auValue[uThat]))
+					{
+						return true;
+					}
+				}
+				for (size_t uIndexR = std::min(std::size(m_auValue), std::size(that.m_auValue)); 0 < uIndexR; uIndexR--)
+				{
+					if (tPredicate(m_auValue[uIndexR - 1], that.m_auValue[uIndexR - 1]))
+					{
+						return true;
+					}
+				}
+				return false;
+			}
+			template <size_t uTHAT_BITS, typename Tthat_traits>
+			bool operator < (Cinteger<uTHAT_BITS, Tthat_traits> const & that) const
+			{
+				return compare(that, std::less<unsigned_type>());
+			}
+			template <size_t uTHAT_BITS, typename Tthat_traits>
+			bool operator <= (Cinteger<uTHAT_BITS, Tthat_traits> const & that) const
+			{
+				return compare(that, std::less_equal<unsigned_type>());
+			}
+			template <size_t uTHAT_BITS, typename Tthat_traits>
+			bool operator > (Cinteger<uTHAT_BITS, Tthat_traits> const & that) const
+			{
+				return compare(that, std::greater<unsigned_type>());
+			}
+			template <size_t uTHAT_BITS, typename Tthat_traits>
+			bool operator >= (Cinteger<uTHAT_BITS, Tthat_traits> const & that) const
+			{
+				return compare(that, std::greater_equal<unsigned_type>());
+			}
+			template <size_t uTHAT_BITS, typename Tthat_traits>
+			bool operator != (Cinteger<uTHAT_BITS, Tthat_traits> const & that) const
+			{
+				return compare(that, std::not_equal_to<unsigned_type>());
+			}
+			template <size_t uTHAT_BITS, typename Tthat_traits>
+			bool operator == (Cinteger<uTHAT_BITS, Tthat_traits> const & that) const
+			{
+				return compare(that, std::not_equal_to<unsigned_type>()) == false; // must not use 'equal_to'
+			}
 		};
-		template <size_t u0, size_t u1>
+		template <size_t u0, size_t u1, typename Ttraits>
 		struct integers_traits
 		{
-			using add_type = Cinteger<(u0 > u1) ? (u0 + 1) : (u1 + 1)>;
-			using minus_type = Cinteger<(u0 > u1) ? (u0 + 1) : (u1 + 1)>;
-			using multiplies_type = Cinteger<u0 + u1>;
-			using dividies_type = Cinteger<u0>;
+			using add_type = Cinteger<(u0 > u1) ? (u0 + 1) : (u1 + 1), Ttraits>;
+			using minus_type = Cinteger<(u0 > u1) ? (u0 + 1) : (u1 + 1), Ttraits>;
+			using multiplies_type = Cinteger<u0 + u1, Ttraits>;
+			using dividies_type = Cinteger<u0, Ttraits>;
 		};
-		template <size_t u0, size_t u1>
-		auto operator + (Cinteger<u0> const & left, Cinteger<u1> const & right)
+		template <size_t u0, size_t u1, typename Ttraits>
+		auto operator + (Cinteger<u0, Ttraits> const & left, Cinteger<u1, Ttraits> const & right)
 		{
-			return typename integers_traits<u0, u1>::add_type(left, right, add_tag());
+			return typename integers_traits<u0, u1, Ttraits>::add_type(left, right, add_tag());
 		}
-		template <size_t u0, size_t u1>
-		auto operator - (Cinteger<u0> const & left, Cinteger<u1> const & right)
+		template <size_t u0, size_t u1, typename Ttraits>
+		auto operator - (Cinteger<u0, Ttraits> const & left, Cinteger<u1, Ttraits> const & right)
 		{
-			return typename integers_traits<u0, u1>::minus_type(left, right, minus_tag());
+			return typename integers_traits<u0, u1, Ttraits>::minus_type(left, right, minus_tag());
 		}
-		template <size_t u0, size_t u1>
-		auto operator * (Cinteger<u0> const & left, Cinteger<u1> const & right)
+		template <size_t u0, size_t u1, typename Ttraits>
+		auto operator * (Cinteger<u0, Ttraits> const & left, Cinteger<u1, Ttraits> const & right)
 		{
-			return typename integers_traits<u0, u1>::multiplies_type(left, right, multiplies_tag());
+			return typename integers_traits<u0, u1, Ttraits>::multiplies_type(left, right, multiplies_tag());
 		}
-		template <size_t u0, size_t u1>
-		auto operator / (Cinteger<u0> const & left, Cinteger<u1> const & right)
+		template <size_t u0, size_t u1, typename Ttraits>
+		auto operator / (Cinteger<u0, Ttraits> const & left, Cinteger<u1, Ttraits> const & right)
 		{
-			return typename integers_traits<u0, u1>::multiplies_type(left, right, dividies_tag());
+			return typename integers_traits<u0, u1, Ttraits>::multiplies_type(left, right, dividies_tag());
 		}
 
 		// a/b
